@@ -23,21 +23,16 @@ except ImportError:
 import torch
 from torch.cuda.amp import autocast
 import argparse
+import torchvision.transforms.functional as TF
 
-os.environ.setdefault("TORCH_HOME", str(Path("models") / "torch" / "hub"))
+# Local imports
+
 
 # --- Model Imports ---
 try:
     from ultralytics import YOLO
 except ImportError:
     logger.error("未安装 ultralytics 库，请运行: pip install ultralytics")
-    sys.exit(1)
-
-try:
-    from iopaint.model_manager import ModelManager
-    from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as InpaintConfig
-except ImportError:
-    logger.error("未安装 iopaint 库，请运行: pip install iopaint")
     sys.exit(1)
 
 try:
@@ -53,6 +48,7 @@ INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
 IMAGE_EXTS = { ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
 VIDEO_EXTS = { ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm"}
+LAMA_MODEL_PATH = Path("models") / "big-lama.pt"
 
 # --- Timing Class ---
 class Timing:
@@ -178,40 +174,76 @@ def load_models(args):
             logger.error(f"YOLO 模型文件不存在: {args.yolo_model}")
             sys.exit(1)
         logger.info(f"加载 YOLO 模型: {args.yolo_model}")
-        model = YOLO(str(args.yolo_model))
-        model.to(args.device)
-        processor = None
+        detection_model = YOLO(str(args.yolo_model))
+        detection_model.to(args.device)
+        detection_processor = None
     else: # florence
         model_name = f"microsoft/Florence-2-{args.model_size}"
         logger.info(f"加载 Florence-2 {args.model_size} 模型...")
-        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, local_files_only=True).to(args.device).eval()
-        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, local_files_only=True)
+        detection_model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, local_files_only=True).to(args.device).eval()
+        detection_processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, local_files_only=True)
         if args.half_precision:
-            model = model.half()
+            detection_model = detection_model.half()
     TIMING.model_load_secs = time.perf_counter() - t0
     logger.info(f"检测模型加载完成，用时 {TIMING.model_load_secs:.2f}s")
     
+    # Load LaMa model directly from Torch Script
     t_lama = time.perf_counter()
-    lama_manager = ModelManager(name="lama", device=args.device)
+    logger.info(f"加载 LaMa Torch Script 模型: {LAMA_MODEL_PATH}")
+    if not LAMA_MODEL_PATH.exists():
+        logger.error(f"LaMa 模型文件不存在: {LAMA_MODEL_PATH}")
+        logger.error("请将 big-lama.pt 文件放置在 models/ 目录下。")
+        sys.exit(1)
+    
+    lama_model = torch.load(LAMA_MODEL_PATH, map_location="cpu")
+    lama_model.to(args.device)
+    lama_model.eval()
     TIMING.lama_load_secs = time.perf_counter() - t_lama
     logger.info(f"LaMa 加载完成，用时 {TIMING.lama_load_secs:.2f}s")
     
-    return model, processor, lama_manager
+    return detection_model, detection_processor, lama_model
 
-def inpaint_with_lama(image_rgb: np.ndarray, mask: np.ndarray, manager: ModelManager, args) -> np.ndarray:
-    config = InpaintConfig(
-        ldm_sampler=LDMSampler.ddim,
-        hd_strategy=HDStrategy.CROP,
-        hd_strategy_crop_margin=32,
-        hd_strategy_crop_trigger_size=1024,
-        hd_strategy_resize_limit=args.resize_limit,
-    )
+def inpaint_with_lama_batch(images_rgb: List[np.ndarray], masks: List[np.ndarray], lama_model, args) -> List[np.ndarray]:
     t0 = time.perf_counter()
-    result = manager(image_rgb, mask, config)
-    TIMING.lama_inpaint_secs += time.perf_counter() - t0
-    return np.clip(result, 0, 255).astype(np.uint8)
+    
+    # 1. Pre-processing
+    batch_size = len(images_rgb)
+    h, w = images_rgb[0].shape[:2]
+    batch_images = torch.zeros(batch_size, 3, h, w, dtype=torch.float32)
+    batch_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32)
 
-def process_image(path: Path, model, processor, lama_manager, args):
+    for i in range(batch_size):
+        img_tensor = torch.from_numpy(images_rgb[i].astype(np.float32) / 255.0).permute(2, 0, 1)
+        mask_tensor = torch.from_numpy(masks[i].astype(np.float32) / 255.0).unsqueeze(0)
+        batch_images[i] = img_tensor
+        batch_masks[i] = mask_tensor
+
+    masked_images = batch_images * (1 - batch_masks)
+    masked_images = masked_images.to(args.device)
+    batch_masks = batch_masks.to(args.device)
+
+    # 2. Inference with power-of-two check for half precision
+    use_fp16 = args.half_precision
+    if use_fp16 and ((h & (h - 1) != 0) or (w & (w - 1) != 0)):
+        logger.warning(f"图像尺寸 [{h}, {w}] 不是2的幂，LaMa修复临时禁用半精度以避免cuFFT错误。")
+        use_fp16 = False
+
+    with torch.no_grad(), autocast(enabled=use_fp16):
+        inpainted_batch = lama_model(masked_images, batch_masks)
+
+    # 3. Post-processing
+    inpainted_results = []
+    for i in range(batch_size):
+        output_img = inpainted_batch[i].permute(1, 2, 0).cpu().numpy()
+        output_img = (output_img * 255).astype(np.uint8)
+        inpainted_results.append(output_img)
+
+    TIMING.lama_inpaint_secs += time.perf_counter() - t0
+    return inpainted_results
+
+
+
+def process_image(path: Path, detection_model, detection_processor, lama_model, args):
     logger.info(f"处理图片: {path.name}")
     t_r0 = time.perf_counter()
     img_bgr = cv2.imread(str(path))
@@ -222,23 +254,24 @@ def process_image(path: Path, model, processor, lama_manager, args):
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
     if args.model == 'yolo':
-        mask = get_mask_yolo(img_rgb, model, args)
+        mask = get_mask_yolo(img_rgb, detection_model, args)
     else:
-        mask = get_mask_florence(img_rgb, model, processor, args.device, args)
+        mask = get_mask_florence(img_rgb, detection_model, detection_processor, args.device, args)
 
     if not np.any(mask):
-        result_bgr = img_bgr
+        result_rgb = img_rgb
     else:
-        result_bgr = inpaint_with_lama(img_rgb, mask, lama_manager, args)
+        # Use the batch function with a batch size of 1
+        result_rgb = inpaint_with_lama_batch([img_rgb], [mask], lama_model, args)[0]
     
     out_path = Path(args.output) / path.name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t_w0 = time.perf_counter()
-    cv2.imwrite(str(out_path), result_bgr)
+    cv2.imwrite(str(out_path), cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR))
     TIMING.io_write_secs += time.perf_counter() - t_w0
     TIMING.images += 1
 
-def process_video(path: Path, model, processor, lama_manager, args):
+def process_video(path: Path, detection_model, detection_processor, lama_model, args):
     logger.info(f"处理视频: {path.name}")
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -254,36 +287,63 @@ def process_video(path: Path, model, processor, lama_manager, args):
 
     pbar = tqdm(total=total_frames, desc=f"处理 {path.name}", unit="frame") if tqdm and total_frames > 0 else None
     
-    frame_idx, last_mask = 0, None
+    batch_frames_rgb = []
+    last_mask = None
+
     while True:
         t_r0 = time.perf_counter()
         ret, frame_bgr = cap.read()
         TIMING.io_read_secs += time.perf_counter() - t_r0
-        if not ret: break
-
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        if ret:
+            batch_frames_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         
-        if args.use_first_frame_detection and frame_idx > 0 and last_mask is not None:
-            mask = last_mask
-        else:
-            if args.model == 'yolo':
-                mask = get_mask_yolo(frame_rgb, model, args)
+        is_batch_full = len(batch_frames_rgb) == args.video_batch_size
+        is_last_batch = (not ret) and (len(batch_frames_rgb) > 0)
+
+        if is_batch_full or is_last_batch:
+            # --- Batch Detection ---
+            batch_masks = []
+            if args.use_first_frame_detection and last_mask is not None:
+                batch_masks = [last_mask] * len(batch_frames_rgb)
             else:
-                mask = get_mask_florence(frame_rgb, model, processor, args.device, args)
-            last_mask = mask
+                # This part can be further optimized by batching YOLO calls if needed
+                for frame_rgb in batch_frames_rgb:
+                    if args.model == 'yolo':
+                        mask = get_mask_yolo(frame_rgb, detection_model, args)
+                    else:
+                        mask = get_mask_florence(frame_rgb, detection_model, detection_processor, args.device, args)
+                    batch_masks.append(mask)
+                    last_mask = mask # Update last_mask for next frames/batches
+            
+            # --- Batch Inpainting ---
+            frames_to_inpaint = []
+            masks_to_inpaint = []
+            inpaint_indices = []
 
-        if not np.any(mask):
-            result_bgr = frame_bgr
-        else:
-            result_bgr = inpaint_with_lama(frame_rgb, mask, lama_manager, args)
-        
-        t_w0 = time.perf_counter()
-        out.write(result_bgr)
-        TIMING.io_write_secs += time.perf_counter() - t_w0
-        
-        if pbar: pbar.update(1)
-        TIMING.frames += 1
-        frame_idx += 1
+            for i, (frame, mask) in enumerate(zip(batch_frames_rgb, batch_masks)):
+                if np.any(mask):
+                    frames_to_inpaint.append(frame)
+                    masks_to_inpaint.append(mask)
+                    inpaint_indices.append(i)
+            
+            final_batch_frames = list(batch_frames_rgb)
+            if frames_to_inpaint:
+                inpainted_frames = inpaint_with_lama_batch(frames_to_inpaint, masks_to_inpaint, lama_model, args)
+                # Splice inpainted frames back into the batch
+                for i, original_index in enumerate(inpaint_indices):
+                    final_batch_frames[original_index] = inpainted_frames[i]
+
+            # --- Batch Write ---
+            t_w0 = time.perf_counter()
+            for frame_rgb in final_batch_frames:
+                out.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            TIMING.io_write_secs += time.perf_counter() - t_w0
+
+            if pbar: pbar.update(len(batch_frames_rgb))
+            TIMING.frames += len(batch_frames_rgb)
+            batch_frames_rgb.clear()
+
+        if not ret: break
 
     if pbar: pbar.close()
     cap.release(); out.release()
@@ -291,7 +351,17 @@ def process_video(path: Path, model, processor, lama_manager, args):
     output_path = Path(args.output) / path.name
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        cmd = ["ffmpeg", "-y", "-i", str(tmp_video), "-i", str(path), "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-c:a", "copy", str(output_path)]
+        # Check for hardware acceleration
+        video_codec = "libx264"
+        if args.device == "cuda":
+            try:
+                subprocess.check_output(["ffmpeg", "-h", "encoder=h264_nvenc"], stderr=subprocess.STDOUT)
+                video_codec = "h264_nvenc"
+                logger.info("使用 NVIDIA GPU (h264_nvenc) 进行硬件加速视频编码。")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                logger.warning("未找到 h264_nvenc 编码器，将使用CPU (libx264) 进行视频编码。")
+
+        cmd = ["ffmpeg", "-y", "-i", str(tmp_video), "-i", str(path), "-map", "0:v:0", "-map", "1:a?", "-c:v", video_codec, "-c:a", "copy", str(output_path)]
         t_aud = time.perf_counter()
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         TIMING.audio_merge_secs += time.perf_counter() - t_aud
@@ -320,6 +390,7 @@ def main():
     parser.add_argument("--expand", type=int, default=5, help="掩码扩张像素")
     parser.add_argument("--max-bbox-percent", type=float, default=10.0, help="单框最大占比(%%) 超过即跳过")
     # --- Video Args ---
+    parser.add_argument("--video-batch-size", type=int, default=8, help="处理视频时的批大小")
     parser.add_argument("--use-first-frame-detection", action="store_true", default=False, help="视频使用首帧检测掩码")
     # --- YOLO Args ---
     parser.add_argument("--yolo-model", type=str, default="models/yolo.pt", help="YOLO 模型文件路径")

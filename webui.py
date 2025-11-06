@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 import os
 
-def process_media(model, input_file, conf_threshold, iou_threshold, single_detection, yolo_imgsz, model_size, watermark_text, use_first_frame_mask, resize_limit, expand, max_bbox_percent, half_precision):
+def process_media(model, input_file, conf_threshold, iou_threshold, single_detection, yolo_imgsz, model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision):
     if input_file is None:
         return None, "Please upload a file."
 
@@ -42,6 +42,7 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
         ])
 
     if input_path.suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv'}:
+        cmd.extend(["--video-batch-size", str(video_batch_size)])
         if use_first_frame_mask:
             cmd.append("--use-first-frame-detection")
 
@@ -95,6 +96,7 @@ with gr.Blocks() as demo:
 
     with gr.Accordion("Video Specific Options", open=False):
         use_first_frame_mask = gr.Checkbox(label="Use First Frame Mask for Videos", value=False, info="视频处理时，是否只在第一帧检测水印并将其掩码应用于所有后续帧。可提高视频处理速度和一致性，但可能不适用于水印位置变化的视频。")
+        video_batch_size = gr.Slider(minimum=1, maximum=64, value=8, step=1, label="Video Batch Size", info="处理视频时一次性读入内存并处理的帧数。更大的值可以提高GPU利用率，但需要更多显存。")
 
     def toggle_model_options(model):
         if model == "yolo":
@@ -108,7 +110,7 @@ with gr.Blocks() as demo:
         fn=process_media,
         inputs=[
             model_selector, image_input, conf_threshold, iou_threshold, single_detection, yolo_imgsz, 
-            model_size, watermark_text, use_first_frame_mask, resize_limit, expand, max_bbox_percent, half_precision
+            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision
         ],
         outputs=[image_output, image_status]
     )
@@ -117,7 +119,7 @@ with gr.Blocks() as demo:
         fn=process_media,
         inputs=[
             model_selector, video_input, conf_threshold, iou_threshold, single_detection, yolo_imgsz, 
-            model_size, watermark_text, use_first_frame_mask, resize_limit, expand, max_bbox_percent, half_precision
+            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision
         ],
         outputs=[video_output, video_status]
     )
