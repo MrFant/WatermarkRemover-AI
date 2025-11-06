@@ -1,0 +1,364 @@
+
+import os
+import sys
+import json
+import cv2
+import time
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Tuple, Union
+import click
+import numpy as np
+from PIL import Image
+from loguru import logger
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    logger.error("未安装 tqdm 库，请运行: pip install tqdm")
+    tqdm = None
+
+import torch
+from torch.cuda.amp import autocast
+import argparse
+
+os.environ.setdefault("TORCH_HOME", str(Path("models") / "torch" / "hub"))
+
+# --- Model Imports ---
+try:
+    from ultralytics import YOLO
+except ImportError:
+    logger.error("未安装 ultralytics 库，请运行: pip install ultralytics")
+    sys.exit(1)
+
+try:
+    from iopaint.model_manager import ModelManager
+    from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as InpaintConfig
+except ImportError:
+    logger.error("未安装 iopaint 库，请运行: pip install iopaint")
+    sys.exit(1)
+
+try:
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    from enum import Enum
+except ImportError:
+    logger.error("未安装 transformers 库，请运行: pip install transformers")
+    sys.exit(1)
+
+
+# --- Global Settings ---
+INPUT_DIR = Path("input")
+OUTPUT_DIR = Path("output")
+IMAGE_EXTS = { ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
+VIDEO_EXTS = { ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm"}
+
+# --- Timing Class ---
+class Timing:
+    def __init__(self):
+        self.total_start = time.perf_counter()
+        self.model_load_secs = 0.0
+        self.lama_load_secs = 0.0
+        self.io_read_secs = 0.0
+        self.io_write_secs = 0.0
+        self.detect_secs = 0.0
+        self.mask_make_secs = 0.0
+        self.lama_inpaint_secs = 0.0
+        self.audio_merge_secs = 0.0
+        self.images = 0
+        self.frames = 0
+    def summary(self):
+        total_time = time.perf_counter() - self.total_start
+        logger.info("\n⏱️ 性能统计汇总:")
+        logger.info(f"  总耗时: {total_time:.2f}s")
+        logger.info(f"  模型加载: 检测模型 {self.model_load_secs:.2f}s, LaMa {self.lama_load_secs:.2f}s")
+        logger.info(f"  I/O 读取: {self.io_read_secs:.2f}s, I/O 写入: {self.io_write_secs:.2f}s")
+        logger.info(f"  检测: {self.detect_secs:.2f}s, 掩码生成: {self.mask_make_secs:.2f}s")
+        logger.info(f"  LaMa修复: {self.lama_inpaint_secs:.2f}s, 音频合并: {self.audio_merge_secs:.2f}s")
+        if self.images > 0:
+            avg_img = (self.detect_secs + self.mask_make_secs + self.lama_inpaint_secs) / self.images
+            logger.info(f"  图片数: {self.images}, 平均每图: {avg_img:.2f}s")
+        if self.frames > 0:
+            avg_frame = (self.detect_secs + self.mask_make_secs + self.lama_inpaint_secs) / self.frames
+            logger.info(f"  视频帧数: {self.frames}, 平均每帧: {avg_frame:.3f}s")
+
+TIMING = None
+
+# --- Florence-2 Specific Functions ---
+class TaskType(str, Enum):
+    OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
+
+def enhance_contrast(image: np.ndarray, clip_limit: float = 3.0, tile_size: int = 8) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
+    cl = clahe.apply(l)
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    cl_sharpened = cv2.filter2D(cl, -1, kernel)
+    enhanced_lab = cv2.merge((cl_sharpened, a, b))
+    return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+
+def identify(task_prompt: TaskType, image: np.ndarray, text_input: str, model: AutoModelForCausalLM, processor: AutoProcessor, device: str):
+    prompt = task_prompt.value if text_input is None else task_prompt.value + text_input
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        early_stopping=False,
+        do_sample=False,
+        num_beams=3,
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    return processor.post_process_generation(
+        generated_text, task=task_prompt.value, image_size=(image.shape[1], image.shape[0])
+    )
+
+def get_mask_florence(image: np.ndarray, model, processor, device: str, args) -> np.ndarray:
+    t0 = time.perf_counter()
+    enh_image = enhance_contrast(image)
+    with autocast(enabled=args.half_precision):
+        parsed_answer = identify(TaskType.OPEN_VOCAB_DETECTION, enh_image, args.watermark_text, model, processor, device)
+    TIMING.detect_secs += time.perf_counter() - t0
+    
+    t_mask = time.perf_counter()
+    mask_np = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+    detection_key = "<OPEN_VOCABULARY_DETECTION>"
+    if detection_key in parsed_answer and "bboxes" in parsed_answer[detection_key]:
+        image_area = image.shape[1] * image.shape[0]
+        for bbox in parsed_answer[detection_key]["bboxes"]:
+            x1, y1, x2, y2 = map(int, bbox)
+            bbox_area = (x2 - x1) * (y2 - y1)
+            if (bbox_area / image_area) * 100 <= args.max_bbox_percent:
+                x1, y1, x2, y2 = max(0, x1 - args.expand), max(0, y1 - args.expand), min(image.shape[1], x2 + args.expand), min(image.shape[0], y2 + args.expand)
+                mask_np[y1:y2, x1:x2] = 255
+    
+    kernel = np.ones((3, 3), np.uint8)
+    mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+    mask_np = cv2.GaussianBlur(mask_np, (5, 5), 0)
+    TIMING.mask_make_secs += time.perf_counter() - t_mask
+    return mask_np
+
+# --- YOLO Specific Functions ---
+def parse_yolo_results(result, names_map: dict) -> List[dict]:
+    dets = []
+    if getattr(result, "boxes", None) is not None:
+        for box, conf, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+            dets.append({"bbox": [int(b) for b in box], "confidence": float(conf), "class_name": names_map.get(int(cls), "N/A")})
+    return dets
+
+def get_mask_yolo(image: np.ndarray, model: YOLO, args) -> np.ndarray:
+    t0 = time.perf_counter()
+    results = model.predict([image], imgsz=args.yolo_imgsz, conf=args.conf_threshold, iou=args.iou_threshold, max_det=(1 if args.single_detection else 300), verbose=False)
+    TIMING.detect_secs += time.perf_counter() - t0
+    
+    t_mask = time.perf_counter()
+    dets = parse_yolo_results(results[0], model.names)
+    if args.single_detection and dets:
+        dets = [max(dets, key=lambda d: d["confidence"])]
+    
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    img_area = image.shape[0] * image.shape[1]
+    for det in dets:
+        x1, y1, x2, y2 = det["bbox"]
+        if img_area > 0 and ((x2 - x1) * (y2 - y1) / img_area) * 100.0 > args.max_bbox_percent:
+            continue
+        x1, y1, x2, y2 = max(0, x1 - args.expand), max(0, y1 - args.expand), min(image.shape[1], x2 + args.expand), min(image.shape[0], y2 + args.expand)
+        mask[y1:y2, x1:x2] = 255
+    TIMING.mask_make_secs += time.perf_counter() - t_mask
+    return mask
+
+# --- Core Processing Functions ---
+def load_models(args):
+    t0 = time.perf_counter()
+    if args.model == 'yolo':
+        if not Path(args.yolo_model).exists():
+            logger.error(f"YOLO 模型文件不存在: {args.yolo_model}")
+            sys.exit(1)
+        logger.info(f"加载 YOLO 模型: {args.yolo_model}")
+        model = YOLO(str(args.yolo_model))
+        model.to(args.device)
+        processor = None
+    else: # florence
+        model_name = f"microsoft/Florence-2-{args.model_size}"
+        logger.info(f"加载 Florence-2 {args.model_size} 模型...")
+        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, local_files_only=True).to(args.device).eval()
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, local_files_only=True)
+        if args.half_precision:
+            model = model.half()
+    TIMING.model_load_secs = time.perf_counter() - t0
+    logger.info(f"检测模型加载完成，用时 {TIMING.model_load_secs:.2f}s")
+    
+    t_lama = time.perf_counter()
+    lama_manager = ModelManager(name="lama", device=args.device)
+    TIMING.lama_load_secs = time.perf_counter() - t_lama
+    logger.info(f"LaMa 加载完成，用时 {TIMING.lama_load_secs:.2f}s")
+    
+    return model, processor, lama_manager
+
+def inpaint_with_lama(image_rgb: np.ndarray, mask: np.ndarray, manager: ModelManager, args) -> np.ndarray:
+    config = InpaintConfig(
+        ldm_sampler=LDMSampler.ddim,
+        hd_strategy=HDStrategy.CROP,
+        hd_strategy_crop_margin=32,
+        hd_strategy_crop_trigger_size=1024,
+        hd_strategy_resize_limit=args.resize_limit,
+    )
+    t0 = time.perf_counter()
+    result = manager(image_rgb, mask, config)
+    TIMING.lama_inpaint_secs += time.perf_counter() - t0
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+def process_image(path: Path, model, processor, lama_manager, args):
+    logger.info(f"处理图片: {path.name}")
+    t_r0 = time.perf_counter()
+    img_bgr = cv2.imread(str(path))
+    TIMING.io_read_secs += time.perf_counter() - t_r0
+    if img_bgr is None:
+        logger.error(f"无法读取图片: {path}"); return
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    
+    if args.model == 'yolo':
+        mask = get_mask_yolo(img_rgb, model, args)
+    else:
+        mask = get_mask_florence(img_rgb, model, processor, args.device, args)
+
+    if not np.any(mask):
+        result_bgr = img_bgr
+    else:
+        result_bgr = inpaint_with_lama(img_rgb, mask, lama_manager, args)
+    
+    out_path = Path(args.output) / path.name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    t_w0 = time.perf_counter()
+    cv2.imwrite(str(out_path), result_bgr)
+    TIMING.io_write_secs += time.perf_counter() - t_w0
+    TIMING.images += 1
+
+def process_video(path: Path, model, processor, lama_manager, args):
+    logger.info(f"处理视频: {path.name}")
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        logger.error(f"无法打开视频: {path}"); return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_video = tmp_dir / "tmp_no_audio.mp4"
+    out = cv2.VideoWriter(str(tmp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    pbar = tqdm(total=total_frames, desc=f"处理 {path.name}", unit="frame") if tqdm and total_frames > 0 else None
+    
+    frame_idx, last_mask = 0, None
+    while True:
+        t_r0 = time.perf_counter()
+        ret, frame_bgr = cap.read()
+        TIMING.io_read_secs += time.perf_counter() - t_r0
+        if not ret: break
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        if args.use_first_frame_detection and frame_idx > 0 and last_mask is not None:
+            mask = last_mask
+        else:
+            if args.model == 'yolo':
+                mask = get_mask_yolo(frame_rgb, model, args)
+            else:
+                mask = get_mask_florence(frame_rgb, model, processor, args.device, args)
+            last_mask = mask
+
+        if not np.any(mask):
+            result_bgr = frame_bgr
+        else:
+            result_bgr = inpaint_with_lama(frame_rgb, mask, lama_manager, args)
+        
+        t_w0 = time.perf_counter()
+        out.write(result_bgr)
+        TIMING.io_write_secs += time.perf_counter() - t_w0
+        
+        if pbar: pbar.update(1)
+        TIMING.frames += 1
+        frame_idx += 1
+
+    if pbar: pbar.close()
+    cap.release(); out.release()
+
+    output_path = Path(args.output) / path.name
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        cmd = ["ffmpeg", "-y", "-i", str(tmp_video), "-i", str(path), "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-c:a", "copy", str(output_path)]
+        t_aud = time.perf_counter()
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        TIMING.audio_merge_secs += time.perf_counter() - t_aud
+        logger.info(f"已合并音频并输出: {output_path.name}")
+    except Exception as e:
+        logger.warning(f"合并音频失败: {e}. 将复制无音频视频。")
+        shutil.copyfile(tmp_video, output_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+def main():
+    global TIMING
+    TIMING = Timing()
+    torch.set_grad_enabled(False)
+    cv2.setNumThreads(0)
+
+    parser = argparse.ArgumentParser(description="通用水印去除管线 (YOLO & Florence)")
+    # --- General Args ---
+    parser.add_argument("--input", type=str, default=str(INPUT_DIR), help="输入路径：目录或单个文件")
+    parser.add_argument("--output", type=str, default=str(OUTPUT_DIR), help="输出目录")
+    parser.add_argument("--model", type=str, choices=["yolo", "florence"], default="yolo", help="选择检测模型")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu", help="运行设备")
+    parser.add_argument("--half-precision", action="store_true", default=True, help="启用半精度(FP16)")
+    parser.add_argument("--no-half-precision", dest="half_precision", action="store_false", help="禁用半精度(FP16)")
+    parser.add_argument("--resize-limit", type=int, default=768, help="LaMa hd_strategy_resize_limit")
+    parser.add_argument("--expand", type=int, default=5, help="掩码扩张像素")
+    parser.add_argument("--max-bbox-percent", type=float, default=10.0, help="单框最大占比(%%) 超过即跳过")
+    # --- Video Args ---
+    parser.add_argument("--use-first-frame-detection", action="store_true", default=False, help="视频使用首帧检测掩码")
+    # --- YOLO Args ---
+    parser.add_argument("--yolo-model", type=str, default="models/yolo.pt", help="YOLO 模型文件路径")
+    parser.add_argument("--conf-threshold", type=float, default=0.6, help="YOLO置信度阈值")
+    parser.add_argument("--iou-threshold", type=float, default=0.45, help="YOLO IOU阈值")
+    parser.add_argument("--single-detection", action="store_true", help="仅保留最高置信度的一个检测框")
+    parser.add_argument("--yolo-imgsz", type=int, default=640, help="YOLO模型推理时的图像尺寸。较小的值可以加速检测。")
+    # --- Florence Args ---
+    parser.add_argument("--model-size", type=str, choices=["base", "large"], default="large", help="Size of Florence-2 model (base uses less memory)")
+    parser.add_argument("--watermark-text", type=str, default="white English text watermark", help="Text prompt for watermark detection (default: 'white English text watermark')")
+
+    args = parser.parse_args()
+    
+    logger.info(f"设备: {args.device}, 检测模型: {args.model}")
+    if args.device == "cuda": torch.backends.cudnn.benchmark = True
+
+    model, processor, lama_manager = load_models(args)
+    
+    input_path = Path(args.input)
+    if not input_path.exists():
+        logger.error(f"输入路径不存在: {input_path}"); sys.exit(1)
+
+    files_to_process = []
+    if input_path.is_file():
+        files_to_process.append(input_path)
+    else:
+        files_to_process.extend([p for p in input_path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS.union(VIDEO_EXTS)])
+
+    for path in files_to_process:
+        try:
+            if path.suffix.lower() in IMAGE_EXTS:
+                process_image(path, model, processor, lama_manager, args)
+            elif path.suffix.lower() in VIDEO_EXTS:
+                process_video(path, model, processor, lama_manager, args)
+        except Exception as e:
+            logger.error(f"处理文件失败: {path.name}: {e}")
+
+    logger.info(f"✅ 全部完成！输出目录: {args.output}")
+    TIMING.summary()
+
+if __name__ == "__main__":
+    main()

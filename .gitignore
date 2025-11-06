@@ -1,0 +1,22 @@
+# Directories to ignore
+__pycache__/
+.vscode/
+.trae/
+
+# Project-specific directories
+素材/
+input/
+output/
+output_webui/
+detection/
+
+# Model files - assuming they are large and shouldn't be in git
+models/
+
+# General python ignores
+*.pyc
+*.pyo
+*.pyd
+
+# Other
+.DS_Store
