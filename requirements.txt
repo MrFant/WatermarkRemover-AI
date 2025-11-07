@@ -1,0 +1,11 @@
+torch
+torchvision
+ultralytics
+gradio
+numpy
+opencv-python
+loguru
+Pillow==9.5.0
+tqdm
+transformers
+click

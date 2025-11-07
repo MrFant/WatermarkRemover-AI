@@ -5,7 +5,8 @@ import os
 
 def process_media(model, input_file, conf_threshold, iou_threshold, single_detection, yolo_imgsz, model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision):
     if input_file is None:
-        return None, "Please upload a file."
+        yield None, "Please upload a file."
+        return
 
     input_path = Path(input_file)
     output_dir = Path("output_webui")
@@ -13,7 +14,7 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
     output_path = output_dir / input_path.name
 
     cmd = [
-        "python", "main.py",
+        "python", "-u", "main.py",  # Use -u for unbuffered output
         "--input", str(input_path),
         "--output", str(output_dir),
         "--model", model,
@@ -38,7 +39,7 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
     else: # florence
         cmd.extend([
             "--model-size", model_size,
-            "--watermark-text", f'"{watermark_text}"'
+            f'--watermark-text="{watermark_text}"'
         ])
 
     if input_path.suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv'}:
@@ -48,13 +49,31 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
 
     print(f"Running command: {' '.join(cmd)}")
 
-    try:
-        process = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        status = f"Processing complete.\nOutput saved to {output_path}\n\n--- Log ---\n{process.stdout}\n{process.stderr}"
-        return str(output_path), status
-    except subprocess.CalledProcessError as e:
-        status = f"An error occurred.\n\n--- Error Log ---\n{e.stdout}\n{e.stderr}"
-        return None, status
+    # Use Popen for real-time streaming
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='gbk', bufsize=1)
+
+    log_output = ""
+    for line in iter(process.stdout.readline, '\n'):
+        if not line:
+            break
+        
+        line_str = str(line)
+        # Print to console in real-time
+        print(line_str.strip())
+        
+        # Update and yield to Gradio UI
+        log_output += line_str
+        yield None, log_output # Yield partial log, no output file yet
+
+    process.stdout.close()
+    process.wait()
+
+    if process.returncode == 0:
+        final_status = f"✅ Processing complete.\nOutput saved to {output_path}\n\n--- Full Log ---\n{log_output}"
+        yield str(output_path), final_status
+    else:
+        final_status = f"❌ An error occurred.\n\n--- Error Log ---\n{log_output}"
+        yield None, final_status
 
 with gr.Blocks() as demo:
     gr.Markdown("# Watermark Remover AI")
@@ -65,15 +84,15 @@ with gr.Blocks() as demo:
     with gr.Tabs():
         with gr.TabItem("Image"):
             with gr.Row():
-                image_input = gr.Image(type="filepath", label="Input Image")
-                image_output = gr.Image(label="Output Image")
+                image_input = gr.Image(type="filepath", label="Input Image", height=400)
+                image_output = gr.Image(label="Output Image", height=400)
             image_status = gr.Textbox(label="Status", lines=10)
             process_image_button = gr.Button("Remove Watermark from Image")
 
         with gr.TabItem("Video"):
             with gr.Row():
-                video_input = gr.Video(label="Input Video")
-                video_output = gr.Video(label="Output Video")
+                video_input = gr.Video(label="Input Video", height=400)
+                video_output = gr.Video(label="Output Video", height=400)
             video_status = gr.Textbox(label="Status", lines=10)
             process_video_button = gr.Button("Remove Watermark from Video")
 
@@ -87,7 +106,7 @@ with gr.Blocks() as demo:
         with gr.Column(visible=True) as yolo_options:
             conf_threshold = gr.Slider(minimum=0.1, maximum=1.0, value=0.6, label="YOLO Confidence Threshold", info="YOLO模型检测水印的置信度阈值。值越高，检测结果越可靠，但可能漏掉不明显的水印。")
             iou_threshold = gr.Slider(minimum=0.1, maximum=1.0, value=0.45, label="YOLO IOU Threshold", info="YOLO模型在非极大值抑制（NMS）中用于合并重叠检测框的交并比阈值。值越高，合并越严格。")
-            single_detection = gr.Checkbox(label="YOLO Single Detection", value=False, info="YOLO模式下，是否只保留置信度最高的单个检测框。适用于图片中只有一个主要水印的场景。")
+            single_detection = gr.Checkbox(label="YOLO Single Detection", value=True, info="YOLO模式下，是否只保留置信度最高的单个检测框。适用于图片中只有一个主要水印的场景。")
             yolo_imgsz = gr.Slider(minimum=320, maximum=1280, value=640, step=32, label="YOLO Image Size (imgsz)", info="YOLO模型推理时的图像尺寸。较小的值可以加速检测，但可能影响小目标检测精度。")
         
         with gr.Column(visible=False) as florence_options:

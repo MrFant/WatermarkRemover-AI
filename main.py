@@ -306,14 +306,37 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
             if args.use_first_frame_detection and last_mask is not None:
                 batch_masks = [last_mask] * len(batch_frames_rgb)
             else:
-                # This part can be further optimized by batching YOLO calls if needed
-                for frame_rgb in batch_frames_rgb:
-                    if args.model == 'yolo':
-                        mask = get_mask_yolo(frame_rgb, detection_model, args)
-                    else:
+                if args.model == 'yolo':
+                    # Run YOLO detection on the entire batch at once
+                    t0 = time.perf_counter()
+                    yolo_results = detection_model.predict(batch_frames_rgb, imgsz=args.yolo_imgsz, conf=args.conf_threshold, iou=args.iou_threshold, verbose=False)
+                    TIMING.detect_secs += time.perf_counter() - t0
+
+                    # Create masks from the batch results
+                    t_mask = time.perf_counter()
+                    for i, result in enumerate(yolo_results):
+                        dets = parse_yolo_results(result, detection_model.names)
+                        if args.single_detection and dets:
+                            dets = [max(dets, key=lambda d: d["confidence"])]
+                        
+                        mask = np.zeros(batch_frames_rgb[i].shape[:2], dtype=np.uint8)
+                        img_area = batch_frames_rgb[i].shape[0] * batch_frames_rgb[i].shape[1]
+                        for det in dets:
+                            x1, y1, x2, y2 = det["bbox"]
+                            if img_area > 0 and ((x2 - x1) * (y2 - y1) / img_area) * 100.0 > args.max_bbox_percent:
+                                continue
+                            x1, y1, x2, y2 = max(0, x1 - args.expand), max(0, y1 - args.expand), min(batch_frames_rgb[i].shape[1], x2 + args.expand), min(batch_frames_rgb[i].shape[0], y2 + args.expand)
+                            mask[y1:y2, x1:x2] = 255
+                        batch_masks.append(mask)
+                    TIMING.mask_make_secs += time.perf_counter() - t_mask
+                    
+                    if batch_masks:
+                        last_mask = batch_masks[-1]
+                else: # Florence (remains single-frame processing in loop)
+                    for frame_rgb in batch_frames_rgb:
                         mask = get_mask_florence(frame_rgb, detection_model, detection_processor, args.device, args)
-                    batch_masks.append(mask)
-                    last_mask = mask # Update last_mask for next frames/batches
+                        batch_masks.append(mask)
+                        last_mask = mask
             
             # --- Batch Inpainting ---
             frames_to_inpaint = []
@@ -394,12 +417,12 @@ def main():
     parser.add_argument("--use-first-frame-detection", action="store_true", default=False, help="视频使用首帧检测掩码")
     # --- YOLO Args ---
     parser.add_argument("--yolo-model", type=str, default="models/yolo.pt", help="YOLO 模型文件路径")
-    parser.add_argument("--conf-threshold", type=float, default=0.6, help="YOLO置信度阈值")
+    parser.add_argument("--conf-threshold", type=float, default=0.25, help="YOLO置信度阈值")
     parser.add_argument("--iou-threshold", type=float, default=0.45, help="YOLO IOU阈值")
-    parser.add_argument("--single-detection", action="store_true", help="仅保留最高置信度的一个检测框")
+    parser.add_argument("--single-detection", default=True, action="store_true", help="仅保留最高置信度的一个检测框")
     parser.add_argument("--yolo-imgsz", type=int, default=640, help="YOLO模型推理时的图像尺寸。较小的值可以加速检测。")
     # --- Florence Args ---
-    parser.add_argument("--model-size", type=str, choices=["base", "large"], default="large", help="Size of Florence-2 model (base uses less memory)")
+    parser.add_argument("--model-size", type=str, choices=["base", "large"], default="base", help="Size of Florence-2 model (base uses less memory)")
     parser.add_argument("--watermark-text", type=str, default="white English text watermark", help="Text prompt for watermark detection (default: 'white English text watermark')")
 
     args = parser.parse_args()
