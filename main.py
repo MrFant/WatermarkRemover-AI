@@ -195,7 +195,7 @@ def load_models(args):
         logger.error("请将 big-lama.pt 文件放置在 models/ 目录下。")
         sys.exit(1)
     
-    lama_model = torch.load(LAMA_MODEL_PATH, map_location="cpu")
+    lama_model = torch.load(LAMA_MODEL_PATH, map_location=args.device, weights_only=False)
     lama_model.to(args.device)
     lama_model.eval()
     TIMING.lama_load_secs = time.perf_counter() - t_lama
@@ -208,39 +208,87 @@ def inpaint_with_lama_batch(images_rgb: List[np.ndarray], masks: List[np.ndarray
     
     # 1. Pre-processing
     batch_size = len(images_rgb)
-    h, w = images_rgb[0].shape[:2]
+    original_h, original_w = images_rgb[0].shape[:2]
+    
+    # Adjust size to be multiples of 8 (required by LaMa model)
+    h = ((original_h + 7) // 8) * 8
+    w = ((original_w + 7) // 8) * 8
+    
     batch_images = torch.zeros(batch_size, 3, h, w, dtype=torch.float32)
     batch_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32)
 
     for i in range(batch_size):
-        img_tensor = torch.from_numpy(images_rgb[i].astype(np.float32) / 255.0).permute(2, 0, 1)
-        mask_tensor = torch.from_numpy(masks[i].astype(np.float32) / 255.0).unsqueeze(0)
+        # Resize image to multiple of 8
+        img = Image.fromarray(images_rgb[i])
+        img_resized = img.resize((w, h), Image.BICUBIC)
+        img_np = np.array(img_resized).astype(np.float32) / 255.0
+        # 确保图像值在合理范围内
+        img_np = np.clip(img_np, 0.0, 1.0)
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)
+        
+        # Resize mask to multiple of 8
+        mask = Image.fromarray(masks[i])
+        mask_resized = mask.resize((w, h), Image.BICUBIC)
+        mask_np = np.array(mask_resized).astype(np.float32) / 255.0
+        # 二值化处理，确保掩码只有0和1
+        mask_np = (mask_np > 0.5).astype(np.float32)
+        # 检查掩码覆盖率，避免完全覆盖图像
+        mask_coverage = np.mean(mask_np)
+        if mask_coverage > 0.95:
+            logger.warning(f"掩码覆盖率过高 ({mask_coverage:.2f})，可能导致修复效果不佳")
+            # 降低掩码覆盖率
+            mask_np = np.minimum(mask_np, 0.95)
+        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0)
+        
         batch_images[i] = img_tensor
         batch_masks[i] = mask_tensor
 
     masked_images = batch_images * (1 - batch_masks)
+    # 确保 masked_images 不是全黑
+    for i in range(batch_size):
+        img_min = masked_images[i].min().item()
+        img_max = masked_images[i].max().item()
+        if img_max - img_min < 0.01:
+            logger.warning(f"第 {i} 个图像的 masked_images 接近全黑，可能导致修复失败")
+            # 添加少量噪声，避免模型输出全黑
+            masked_images[i] += 0.01 * torch.randn_like(masked_images[i])
+            masked_images[i] = torch.clamp(masked_images[i], 0.0, 1.0)
+    
     masked_images = masked_images.to(args.device)
     batch_masks = batch_masks.to(args.device)
 
-    # 2. Inference with power-of-two check for half precision
-    use_fp16 = args.half_precision
-    if use_fp16 and ((h & (h - 1) != 0) or (w & (w - 1) != 0)):
-        logger.warning(f"图像尺寸 [{h}, {w}] 不是2的幂，LaMa修复临时禁用半精度以避免cuFFT错误。")
-        use_fp16 = False
-
-    with torch.no_grad(), autocast(enabled=use_fp16):
+    # 2. Inference (修复了黑块 Bug)
+    # 必须强制使用 FP32 (autocast enabled=False)，否则 FFC 层会计算出 NaN
+    with torch.no_grad(), autocast(enabled=False):
         inpainted_batch = lama_model(masked_images, batch_masks)
+        # 检查模型输出是否包含 NaN 或 Inf
+        if torch.isnan(inpainted_batch).any() or torch.isinf(inpainted_batch).any():
+            logger.error("LaMa 模型输出包含 NaN 或 Inf")
+            # 使用原始图像作为回退
+            inpainted_batch = masked_images.clone()
 
     # 3. Post-processing
     inpainted_results = []
     for i in range(batch_size):
         output_img = inpainted_batch[i].permute(1, 2, 0).cpu().numpy()
+        # 确保输出值在 [0, 1] 范围内，防止溢出
+        output_img = np.clip(output_img, 0.0, 1.0)
         output_img = (output_img * 255).astype(np.uint8)
-        inpainted_results.append(output_img)
+        
+        # 检查输出是否全黑
+        if np.mean(output_img) < 10:
+            logger.warning(f"第 {i} 个图像修复结果接近全黑，使用原始图像回退")
+            # 使用原始图像的缩放版本作为回退
+            img_pil = Image.fromarray(images_rgb[i])
+            output_img = np.array(img_pil.resize((original_w, original_h), Image.BICUBIC))
+        
+        # Resize back to original size
+        output_img_pil = Image.fromarray(output_img)
+        output_img_resized = output_img_pil.resize((original_w, original_h), Image.BICUBIC)
+        inpainted_results.append(np.array(output_img_resized))
 
     TIMING.lama_inpaint_secs += time.perf_counter() - t0
     return inpainted_results
-
 
 
 def process_image(path: Path, detection_model, detection_processor, lama_model, args):
@@ -264,7 +312,9 @@ def process_image(path: Path, detection_model, detection_processor, lama_model, 
         # Use the batch function with a batch size of 1
         result_rgb = inpaint_with_lama_batch([img_rgb], [mask], lama_model, args)[0]
     
-    out_path = Path(args.output) / path.name
+    # Add suffix to output filename to avoid overwriting original
+    out_filename = path.stem + "_no_watermark" + path.suffix
+    out_path = Path(args.output) / out_filename
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t_w0 = time.perf_counter()
     cv2.imwrite(str(out_path), cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR))
@@ -371,7 +421,9 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
     if pbar: pbar.close()
     cap.release(); out.release()
 
-    output_path = Path(args.output) / path.name
+    # Add suffix to output filename to avoid overwriting original
+    out_filename = path.stem + "_no_watermark" + path.suffix
+    output_path = Path(args.output) / out_filename
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         # Check for hardware acceleration
@@ -407,7 +459,7 @@ def main():
     parser.add_argument("--output", type=str, default=str(OUTPUT_DIR), help="输出目录")
     parser.add_argument("--model", type=str, choices=["yolo", "florence"], default="yolo", help="选择检测模型")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu", help="运行设备")
-    parser.add_argument("--half-precision", action="store_true", default=True, help="启用半精度(FP16)")
+    parser.add_argument("--half-precision", action="store_true", default=False, help="启用半精度(FP16)")
     parser.add_argument("--no-half-precision", dest="half_precision", action="store_false", help="禁用半精度(FP16)")
     parser.add_argument("--resize-limit", type=int, default=768, help="LaMa hd_strategy_resize_limit")
     parser.add_argument("--expand", type=int, default=5, help="掩码扩张像素")
