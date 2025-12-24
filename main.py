@@ -210,25 +210,32 @@ def inpaint_with_lama_batch(images_rgb: List[np.ndarray], masks: List[np.ndarray
     batch_size = len(images_rgb)
     original_h, original_w = images_rgb[0].shape[:2]
     
-    # Adjust size to be multiples of 8 (required by LaMa model)
-    h = ((original_h + 7) // 8) * 8
-    w = ((original_w + 7) // 8) * 8
+    # 优化：降低LaMa处理分辨率，大幅提升速度
+    # 使用命令行参数控制缩放因子，默认缩放为原图的1/2，可调整
+    scale_factor = args.lama_scale  # 缩放因子，0.1-1.0之间，值越小速度越快，质量越低
+    scaled_h = int(original_h * scale_factor)
+    scaled_w = int(original_w * scale_factor)
+    
+    # 确保缩放后的尺寸是8的倍数 (LaMa模型要求)
+    h = ((scaled_h + 7) // 8) * 8
+    w = ((scaled_w + 7) // 8) * 8
     
     batch_images = torch.zeros(batch_size, 3, h, w, dtype=torch.float32)
     batch_masks = torch.zeros(batch_size, 1, h, w, dtype=torch.float32)
 
     for i in range(batch_size):
-        # Resize image to multiple of 8
+        # Resize image to reduced size (multiple of 8)
         img = Image.fromarray(images_rgb[i])
-        img_resized = img.resize((w, h), Image.BICUBIC)
+        # 使用更快的插值方法（LANCZOS比BICUBIC慢，使用BILINEAR更快）
+        img_resized = img.resize((w, h), Image.BILINEAR)
         img_np = np.array(img_resized).astype(np.float32) / 255.0
         # 确保图像值在合理范围内
         img_np = np.clip(img_np, 0.0, 1.0)
         img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)
         
-        # Resize mask to multiple of 8
+        # Resize mask to reduced size (multiple of 8)
         mask = Image.fromarray(masks[i])
-        mask_resized = mask.resize((w, h), Image.BICUBIC)
+        mask_resized = mask.resize((w, h), Image.BILINEAR)
         mask_np = np.array(mask_resized).astype(np.float32) / 255.0
         # 二值化处理，确保掩码只有0和1
         mask_np = (mask_np > 0.5).astype(np.float32)
@@ -279,13 +286,13 @@ def inpaint_with_lama_batch(images_rgb: List[np.ndarray], masks: List[np.ndarray
         if np.mean(output_img) < 10:
             logger.warning(f"第 {i} 个图像修复结果接近全黑，使用原始图像回退")
             # 使用原始图像的缩放版本作为回退
-            img_pil = Image.fromarray(images_rgb[i])
-            output_img = np.array(img_pil.resize((original_w, original_h), Image.BICUBIC))
+            output_img = images_rgb[i].copy()
+        else:
+            # Resize back to original size using faster interpolation
+            output_img_pil = Image.fromarray(output_img)
+            output_img = np.array(output_img_pil.resize((original_w, original_h), Image.BILINEAR))
         
-        # Resize back to original size
-        output_img_pil = Image.fromarray(output_img)
-        output_img_resized = output_img_pil.resize((original_w, original_h), Image.BICUBIC)
-        inpainted_results.append(np.array(output_img_resized))
+        inpainted_results.append(output_img)
 
     TIMING.lama_inpaint_secs += time.perf_counter() - t0
     return inpainted_results
@@ -333,25 +340,34 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
 
     tmp_dir = Path(tempfile.mkdtemp())
     tmp_video = tmp_dir / "tmp_no_audio.mp4"
-    out = cv2.VideoWriter(str(tmp_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    # 使用更高效的编码格式
+    out = cv2.VideoWriter(str(tmp_video), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height), isColor=True)
 
     pbar = tqdm(total=total_frames, desc=f"处理 {path.name}", unit="frame") if tqdm and total_frames > 0 else None
     
     batch_frames_rgb = []
     last_mask = None
+    last_frame = None
+    same_frame_count = 0
+    SKIP_SAME_FRAMES = 10  # 连续相同帧的最大跳过次数
 
     while True:
         t_r0 = time.perf_counter()
         ret, frame_bgr = cap.read()
         TIMING.io_read_secs += time.perf_counter() - t_r0
+        
         if ret:
-            batch_frames_rgb.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            
+            # 记录当前帧，不再跳过相同帧（避免掉帧）
+            last_frame = frame_rgb.copy()
+            batch_frames_rgb.append(frame_rgb)
         
         is_batch_full = len(batch_frames_rgb) == args.video_batch_size
         is_last_batch = (not ret) and (len(batch_frames_rgb) > 0)
 
         if is_batch_full or is_last_batch:
-            # --- Batch Detection ---
+            # --- Batch Detection ---  
             batch_masks = []
             if args.use_first_frame_detection and last_mask is not None:
                 batch_masks = [last_mask] * len(batch_frames_rgb)
@@ -359,7 +375,16 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
                 if args.model == 'yolo':
                     # Run YOLO detection on the entire batch at once
                     t0 = time.perf_counter()
-                    yolo_results = detection_model.predict(batch_frames_rgb, imgsz=args.yolo_imgsz, conf=args.conf_threshold, iou=args.iou_threshold, verbose=False)
+                    # 进一步优化：降低YOLO检测分辨率，加速检测
+                    yolo_results = detection_model.predict(
+                        batch_frames_rgb,
+                        imgsz=args.yolo_imgsz,
+                        conf=args.conf_threshold,
+                        iou=args.iou_threshold,
+                        verbose=False,
+                        half=args.half_precision,  # 启用半精度检测
+                        device=args.device
+                    )
                     TIMING.detect_secs += time.perf_counter() - t0
 
                     # Create masks from the batch results
@@ -370,6 +395,10 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
                             dets = [max(dets, key=lambda d: d["confidence"])]
                         
                         mask = np.zeros(batch_frames_rgb[i].shape[:2], dtype=np.uint8)
+                        if not dets:
+                            batch_masks.append(mask)
+                            continue
+                        
                         img_area = batch_frames_rgb[i].shape[0] * batch_frames_rgb[i].shape[1]
                         for det in dets:
                             x1, y1, x2, y2 = det["bbox"]
@@ -388,7 +417,7 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
                         batch_masks.append(mask)
                         last_mask = mask
             
-            # --- Batch Inpainting ---
+            # --- Batch Inpainting ---  
             frames_to_inpaint = []
             masks_to_inpaint = []
             inpaint_indices = []
@@ -401,12 +430,13 @@ def process_video(path: Path, detection_model, detection_processor, lama_model, 
             
             final_batch_frames = list(batch_frames_rgb)
             if frames_to_inpaint:
+                # 并行优化：如果有多个GPU，可以考虑数据并行
                 inpainted_frames = inpaint_with_lama_batch(frames_to_inpaint, masks_to_inpaint, lama_model, args)
                 # Splice inpainted frames back into the batch
                 for i, original_index in enumerate(inpaint_indices):
                     final_batch_frames[original_index] = inpainted_frames[i]
 
-            # --- Batch Write ---
+            # --- Batch Write ---  
             t_w0 = time.perf_counter()
             for frame_rgb in final_batch_frames:
                 out.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
@@ -462,6 +492,7 @@ def main():
     parser.add_argument("--half-precision", action="store_true", default=False, help="启用半精度(FP16)")
     parser.add_argument("--no-half-precision", dest="half_precision", action="store_false", help="禁用半精度(FP16)")
     parser.add_argument("--resize-limit", type=int, default=768, help="LaMa hd_strategy_resize_limit")
+    parser.add_argument("--lama-scale", type=float, default=0.5, help="LaMa处理分辨率缩放因子，0.1-1.0之间，值越小速度越快，质量越低")
     parser.add_argument("--expand", type=int, default=5, help="掩码扩张像素")
     parser.add_argument("--max-bbox-percent", type=float, default=10.0, help="单框最大占比(%%) 超过即跳过")
     # --- Video Args ---
@@ -472,7 +503,7 @@ def main():
     parser.add_argument("--conf-threshold", type=float, default=0.25, help="YOLO置信度阈值")
     parser.add_argument("--iou-threshold", type=float, default=0.45, help="YOLO IOU阈值")
     parser.add_argument("--single-detection", default=True, action="store_true", help="仅保留最高置信度的一个检测框")
-    parser.add_argument("--yolo-imgsz", type=int, default=640, help="YOLO模型推理时的图像尺寸。较小的值可以加速检测。")
+    parser.add_argument("--yolo-imgsz", type=int, default=480, help="YOLO模型推理时的图像尺寸。较小的值可以加速检测。")
     # --- Florence Args ---
     parser.add_argument("--model-size", type=str, choices=["base", "large"], default="base", help="Size of Florence-2 model (base uses less memory)")
     parser.add_argument("--watermark-text", type=str, default="white English text watermark", help="Text prompt for watermark detection (default: 'white English text watermark')")
