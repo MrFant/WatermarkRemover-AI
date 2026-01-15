@@ -3,7 +3,7 @@ from pathlib import Path
 import subprocess
 import os
 
-def process_media(model, input_file, conf_threshold, iou_threshold, single_detection, yolo_imgsz, model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision):
+def process_media(model, input_file, conf_threshold, iou_threshold, single_detection, yolo_imgsz, model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision, lama_scale):
     if input_file is None:
         yield None, "Please upload a file."
         return
@@ -11,7 +11,9 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
     input_path = Path(input_file)
     output_dir = Path("output_webui")
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / input_path.name
+    # main.py会添加_no_watermark后缀，所以这里要考虑到这一点
+    output_filename = input_path.stem + "_no_watermark" + input_path.suffix
+    output_path = output_dir / output_filename
 
     cmd = [
         "python", "-u", "main.py",  # Use -u for unbuffered output
@@ -21,6 +23,7 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
         "--resize-limit", str(resize_limit),
         "--expand", str(expand),
         "--max-bbox-percent", str(max_bbox_percent),
+        "--lama-scale", str(lama_scale),
     ]
 
     if half_precision:
@@ -37,10 +40,10 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
         if single_detection:
             cmd.append("--single-detection")
     else: # florence
-        cmd.extend([
-            "--model-size", model_size,
-            f'--watermark-text="{watermark_text}"'
-        ])
+            cmd.extend([
+                "--model-size", model_size,
+                "--watermark-text", watermark_text
+            ])
 
     if input_path.suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv'}:
         cmd.extend(["--video-batch-size", str(video_batch_size)])
@@ -70,7 +73,9 @@ def process_media(model, input_file, conf_threshold, iou_threshold, single_detec
 
     if process.returncode == 0:
         final_status = f"✅ Processing complete.\nOutput saved to {output_path}\n\n--- Full Log ---\n{log_output}"
-        yield str(output_path), final_status
+        # 确保路径格式正确，gradio需要完整的文件路径
+        abs_output_path = str(output_path.absolute())
+        yield abs_output_path, final_status
     else:
         final_status = f"❌ An error occurred.\n\n--- Error Log ---\n{log_output}"
         yield None, final_status
@@ -84,15 +89,16 @@ with gr.Blocks() as demo:
     with gr.Tabs():
         with gr.TabItem("Image"):
             with gr.Row():
-                image_input = gr.Image(type="filepath", label="Input Image", height=400)
-                image_output = gr.Image(label="Output Image", height=400)
+                image_input = gr.Image(type="filepath", label="Input Image", height=300, width=400, interactive=True, show_label=True, scale=1)
+                # 设置输出图片类型为filepath，调整大小并支持交互
+                image_output = gr.Image(type="filepath", label="Output Image", height=300, width=400, interactive=True, show_label=True, scale=1)
             image_status = gr.Textbox(label="Status", lines=10)
             process_image_button = gr.Button("Remove Watermark from Image")
 
         with gr.TabItem("Video"):
             with gr.Row():
-                video_input = gr.Video(label="Input Video", height=400)
-                video_output = gr.Video(label="Output Video", height=400)
+                video_input = gr.Video(label="Input Video", height=300, width=400, interactive=True, scale=1)
+                video_output = gr.Video(label="Output Video", height=300, width=400, interactive=True, scale=1)
             video_status = gr.Textbox(label="Status", lines=10)
             process_video_button = gr.Button("Remove Watermark from Video")
 
@@ -101,6 +107,7 @@ with gr.Blocks() as demo:
         expand = gr.Slider(minimum=0, maximum=50, value=5, step=1, label="Expand Pixels", info="水印检测框向外扩展的像素数量。适当增加可确保水印被完全覆盖，但过大会影响周围内容。")
         max_bbox_percent = gr.Slider(minimum=1.0, maximum=50.0, value=10.0, label="Max Bbox Percent", info="单个水印检测框占图像总面积的最大百分比。超过此比例的框将被忽略，以避免误删非水印区域。")
         half_precision = gr.Checkbox(label="Use Half Precision (FP16)", value=True, info="启用半精度浮点运算（FP16），可减少显存使用并加速推理，但可能对精度有轻微影响。")
+        lama_scale = gr.Slider(minimum=0.1, maximum=1.0, value=0.5, step=0.1, label="LaMa Scale Factor", info="LaMa处理分辨率缩放因子，值越小速度越快，质量越低")
 
     with gr.Accordion("Model Specific Options", open=True):
         with gr.Column(visible=True) as yolo_options:
@@ -129,7 +136,7 @@ with gr.Blocks() as demo:
         fn=process_media,
         inputs=[
             model_selector, image_input, conf_threshold, iou_threshold, single_detection, yolo_imgsz, 
-            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision
+            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision, lama_scale
         ],
         outputs=[image_output, image_status]
     )
@@ -138,10 +145,10 @@ with gr.Blocks() as demo:
         fn=process_media,
         inputs=[
             model_selector, video_input, conf_threshold, iou_threshold, single_detection, yolo_imgsz, 
-            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision
+            model_size, watermark_text, use_first_frame_mask, video_batch_size, resize_limit, expand, max_bbox_percent, half_precision, lama_scale
         ],
         outputs=[video_output, video_status]
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(share=True)

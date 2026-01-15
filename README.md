@@ -1,3 +1,9 @@
+---
+title: WatermarkRemover-AI
+app_file: webui.py
+sdk: gradio
+sdk_version: 4.21.0
+---
 # Watermark Remover AI
 
 这是一个功能强大的AI水印去除工具，它利用深度学习模型智能地检测并移除图片和视频中的水印。
